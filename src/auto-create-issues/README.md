@@ -160,7 +160,7 @@ Pour activer cette fonctionnalité, ajoute les variables d’environnement suiva
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_TOKEN: ${{ secrets.PROJECT_AUTOMATION_TOKEN }}  # PAT avec scopes repo + project
           GITHUB_PROJECT_SYNC: "true"
-          GITHUB_PROJECT_TITLE: "Roadmap"           # Optionnel – nom du projet
+          GITHUB_PROJECT_TITLE: "Roadmap"           # Optionnel – surcharger le nom du projet (sinon = nom du repo)
           GITHUB_PROJECT_START_FIELD: "Start date"  # Optionnel – champ date de début
           GITHUB_PROJECT_END_FIELD: "Target date"   # Optionnel – champ date de fin
         run: |

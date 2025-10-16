@@ -14,18 +14,22 @@ checkbox_re = re.compile(r"^\s*[-*]\s+\[(?P<checked>[ xX])\]\s+(?P<text>.+)$")
 due_re = re.compile(r"\bdue:\s*(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
 label_re = re.compile(r"(?:^|\s)#([A-Za-z0-9._/-]+)")
 prio_re = re.compile(r"(?:^|\s)!(p[123])\b", re.IGNORECASE)
+task_id_body_re = re.compile(r"_Task ID:\s*`(?P<tid>[0-9a-f]{12})`_", re.IGNORECASE)
 
 _project_flag = os.environ.get("GITHUB_PROJECT_SYNC")
 PROJECT_SYNC = False
 if _project_flag is not None:
     PROJECT_SYNC = _project_flag.strip().lower() not in {"", "0", "false", "no"}
-PROJECT_TITLE = os.environ.get("GITHUB_PROJECT_TITLE", "Roadmap").strip() or "Roadmap"
+PROJECT_TITLE = os.environ.get("GITHUB_PROJECT_TITLE", "").strip()
 _start_field = os.environ.get("GITHUB_PROJECT_START_FIELD", "Start date").strip()
 PROJECT_START_FIELD_NAME = _start_field or None
 _end_field = os.environ.get("GITHUB_PROJECT_END_FIELD", "Target date").strip()
 PROJECT_END_FIELD_NAME = _end_field or None
 
 OWNER, REPO_NAME = REPO.split("/", 1)
+
+if not PROJECT_TITLE:
+    PROJECT_TITLE = REPO_NAME
 
 _PROJECT_CACHE = None
 
@@ -88,6 +92,49 @@ def _create_date_field(project_id, name):
     if not field or field.get("dataType") != "DATE":
         raise RuntimeError("Impossible de créer un champ date ProjectV2.")
     return field["id"]
+
+def refresh_cache_from_github(cache):
+    """
+    Ensure local cache is in sync with existing GitHub issues to prevent duplicates.
+    """
+    remote = {}
+    duplicates = []
+    page = 1
+    while True:
+        res = gh_api("GET", f"/repos/{REPO}/issues?state=all&labels=from-markdown&per_page=100&page={page}")
+        if not res:
+            break
+        for issue in res:
+            if issue.get("pull_request"):
+                continue
+            body = issue.get("body") or ""
+            match = task_id_body_re.search(body)
+            if not match:
+                continue
+            tid = match.group("tid")
+            number = issue["number"]
+            state = issue["state"]
+            existing = remote.get(tid)
+            if existing:
+                # Keep the oldest issue as canonical, close the others if needed.
+                if number < existing["number"]:
+                    duplicates.append(existing)
+                    remote[tid] = {"number": number, "state": state}
+                else:
+                    duplicates.append({"number": number, "state": state})
+            else:
+                remote[tid] = {"number": number, "state": state}
+        page += 1
+
+    for duplicate in duplicates:
+        if duplicate["state"] != "closed":
+            try:
+                gh_api("PATCH", f"/repos/{REPO}/issues/{duplicate['number']}", {"state": "closed"})
+            except Exception:
+                continue
+
+    for tid, data in remote.items():
+        cache["open"][tid] = data["number"]
 
 def ensure_project_context():
     global _PROJECT_CACHE
@@ -297,6 +344,10 @@ def ensure_labels(labels):
 
 def main():
     cache = load_cache()
+    cache.setdefault("open", {})
+    cache.setdefault("closed", [])
+    # Synchronize cache with existing GitHub issues so we do not recreate duplicates.
+    refresh_cache_from_github(cache)
     seen_ids = set()
     new_tasks = []
 
