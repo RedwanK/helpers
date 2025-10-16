@@ -185,7 +185,7 @@ def _update_date_field(project_id, item_id, field_id, date_value):
     if not field_id:
         return
     gh_graphql("""
-        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: String) {
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: Date) {
           updateProjectV2ItemFieldValue(input: {
             projectId: $projectId,
             itemId: $itemId,
@@ -256,11 +256,12 @@ def sync_project_item(issue_number, due_date, checked):
         today = datetime.datetime.utcnow().date().isoformat()
         _update_date_field(project_id, item_id, context["start_field_id"], today)
 
-    if context["end_field_id"] and not checked:
-        _update_date_field(project_id, item_id, context["end_field_id"], due_date)
-    elif context["end_field_id"] and checked:
-        # Clear end date when the task is marked as completed in Markdown
-        _update_date_field(project_id, item_id, context["end_field_id"], None)
+    if context["end_field_id"]:
+        if not checked and due_date:
+            _update_date_field(project_id, item_id, context["end_field_id"], due_date)
+        else:
+            # Clear end date when no due date is present or the task is completed
+            _update_date_field(project_id, item_id, context["end_field_id"], None)
 
 def list_md_files():
     for p in Path(".").rglob("*.md"):
