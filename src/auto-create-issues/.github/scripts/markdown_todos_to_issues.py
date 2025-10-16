@@ -1,4 +1,5 @@
-import os, re, json, hashlib, urllib.request, urllib.parse
+import datetime
+import os, re, json, hashlib, urllib.request, urllib.parse, urllib.error
 from pathlib import Path
 
 REPO = os.environ["GITHUB_REPOSITORY"]
@@ -14,6 +15,20 @@ due_re = re.compile(r"\bdue:\s*(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
 label_re = re.compile(r"(?:^|\s)#([A-Za-z0-9._/-]+)")
 prio_re = re.compile(r"(?:^|\s)!(p[123])\b", re.IGNORECASE)
 
+_project_flag = os.environ.get("GITHUB_PROJECT_SYNC")
+PROJECT_SYNC = False
+if _project_flag is not None:
+    PROJECT_SYNC = _project_flag.strip().lower() not in {"", "0", "false", "no"}
+PROJECT_TITLE = os.environ.get("GITHUB_PROJECT_TITLE", "Roadmap").strip() or "Roadmap"
+_start_field = os.environ.get("GITHUB_PROJECT_START_FIELD", "Start date").strip()
+PROJECT_START_FIELD_NAME = _start_field or None
+_end_field = os.environ.get("GITHUB_PROJECT_END_FIELD", "Target date").strip()
+PROJECT_END_FIELD_NAME = _end_field or None
+
+OWNER, REPO_NAME = REPO.split("/", 1)
+
+_PROJECT_CACHE = None
+
 def gh_api(method, path, data=None):
     url = f"https://api.github.com{path}"
     req = urllib.request.Request(url, method=method)
@@ -26,6 +41,217 @@ def gh_api(method, path, data=None):
         body = None
     with urllib.request.urlopen(req, body) as resp:
         return json.loads(resp.read().decode())
+
+def gh_graphql(query, variables=None):
+    body = json.dumps({
+        "query": query,
+        "variables": variables or {},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.github.com/graphql",
+        data=body,
+        method="POST",
+    )
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()
+        raise RuntimeError(f"GraphQL HTTP error: {detail}") from exc
+    errors = payload.get("errors")
+    if errors:
+        raise RuntimeError(f"GraphQL errors: {errors}")
+    return payload["data"]
+
+def _create_date_field(project_id, name):
+    data = gh_graphql("""
+        mutation($projectId: ID!, $name: String!) {
+          createProjectV2Field(input: {
+            projectId: $projectId,
+            name: $name,
+            dataType: DATE
+          }) {
+            projectV2Field { id name }
+          }
+        }
+    """, {"projectId": project_id, "name": name})
+    return data["createProjectV2Field"]["projectV2Field"]["id"]
+
+def ensure_project_context():
+    global _PROJECT_CACHE
+    if not PROJECT_SYNC:
+        return None
+    if _PROJECT_CACHE is not None:
+        return _PROJECT_CACHE
+
+    owner_data = gh_graphql("""
+        query($login: String!) {
+          repositoryOwner(login: $login) {
+            __typename
+            id
+            ... on Organization {
+              projectsV2(first: 100) { nodes { id title } }
+            }
+            ... on User {
+              projectsV2(first: 100) { nodes { id title } }
+            }
+          }
+        }
+    """, {"login": OWNER})
+
+    owner_node = owner_data.get("repositoryOwner")
+    if not owner_node:
+        raise RuntimeError(f"Impossible de récupérer le propriétaire GitHub '{OWNER}'.")
+    owner_id = owner_node["id"]
+    projects = owner_node.get("projectsV2", {}).get("nodes", [])
+    project = next((p for p in projects if p["title"].strip().lower() == PROJECT_TITLE.lower()), None)
+
+    if project:
+        project_id = project["id"]
+    else:
+        created = gh_graphql("""
+            mutation($ownerId: ID!, $title: String!) {
+              createProjectV2(input: {
+                ownerId: $ownerId,
+                title: $title
+              }) {
+                projectV2 { id }
+              }
+            }
+        """, {"ownerId": owner_id, "title": PROJECT_TITLE})
+        project_id = created["createProjectV2"]["projectV2"]["id"]
+
+    fields_data = gh_graphql("""
+        query($projectId: ID!) {
+          node(id: $projectId) {
+            ... on ProjectV2 {
+              id
+              fields(first: 50) {
+                nodes {
+                  ... on ProjectV2Field {
+                    id
+                    name
+                    dataType
+                  }
+                }
+              }
+            }
+          }
+        }
+    """, {"projectId": project_id})
+
+    node = fields_data["node"]
+    field_nodes = node.get("fields", {}).get("nodes", [])
+
+    start_field_id = None
+    end_field_id = None
+
+    for field in field_nodes:
+        name = (field.get("name") or "").strip().lower()
+        if not name:
+            continue
+        if field.get("dataType") == "DATE":
+            if PROJECT_START_FIELD_NAME and name == PROJECT_START_FIELD_NAME.lower():
+                start_field_id = field["id"]
+            if PROJECT_END_FIELD_NAME and name == PROJECT_END_FIELD_NAME.lower():
+                end_field_id = field["id"]
+
+    if PROJECT_START_FIELD_NAME and not start_field_id:
+        start_field_id = _create_date_field(project_id, PROJECT_START_FIELD_NAME)
+    if PROJECT_END_FIELD_NAME and not end_field_id:
+        end_field_id = _create_date_field(project_id, PROJECT_END_FIELD_NAME)
+
+    _PROJECT_CACHE = {
+        "project_id": project_id,
+        "owner_id": owner_id,
+        "start_field_id": start_field_id,
+        "end_field_id": end_field_id,
+    }
+    return _PROJECT_CACHE
+
+def _update_date_field(project_id, item_id, field_id, date_value):
+    if not field_id:
+        return
+    gh_graphql("""
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: String) {
+          updateProjectV2ItemFieldValue(input: {
+            projectId: $projectId,
+            itemId: $itemId,
+            fieldId: $fieldId,
+            value: { date: $date }
+          }) {
+            projectV2Item { id }
+          }
+        }
+    """, {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "date": date_value,
+    })
+
+def sync_project_item(issue_number, due_date, checked):
+    context = ensure_project_context()
+    if not context or not issue_number:
+        return
+    issue_query = gh_graphql("""
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            issue(number: $number) {
+              id
+              projectItems(first: 50) {
+                nodes {
+                  id
+                  project { id }
+                }
+              }
+            }
+          }
+        }
+    """, {"owner": OWNER, "repo": REPO_NAME, "number": int(issue_number)})
+
+    repo = issue_query.get("repository")
+    if not repo or not repo.get("issue"):
+        return
+    issue = repo["issue"]
+    issue_id = issue["id"]
+    project_id = context["project_id"]
+    item_nodes = issue.get("projectItems", {}).get("nodes", [])
+
+    item_id = None
+    for item in item_nodes:
+        project = item.get("project") or {}
+        if project.get("id") == project_id:
+            item_id = item["id"]
+            break
+
+    created = False
+    if not item_id:
+        mutation = gh_graphql("""
+            mutation($projectId: ID!, $contentId: ID!) {
+              addProjectV2ItemById(input: {
+                projectId: $projectId,
+                contentId: $contentId
+              }) {
+                item { id }
+              }
+            }
+        """, {"projectId": project_id, "contentId": issue_id})
+        item_id = mutation["addProjectV2ItemById"]["item"]["id"]
+        created = True
+
+    if context["start_field_id"] and created and not checked:
+        today = datetime.datetime.utcnow().date().isoformat()
+        _update_date_field(project_id, item_id, context["start_field_id"], today)
+
+    if context["end_field_id"] and not checked:
+        _update_date_field(project_id, item_id, context["end_field_id"], due_date)
+    elif context["end_field_id"] and checked:
+        # Clear end date when the task is marked as completed in Markdown
+        _update_date_field(project_id, item_id, context["end_field_id"], None)
 
 def list_md_files():
     for p in Path(".").rglob("*.md"):
@@ -120,6 +346,7 @@ def main():
                 "title": title,
                 "body": body,
                 "labels": sorted(labels),
+                "due": due,
             })
 
     # Crée labels si besoin
@@ -154,6 +381,8 @@ def main():
             })
             issue_no = res["number"]
         cache["open"][t["id"]] = issue_no
+        if issue_no:
+            sync_project_item(issue_no, t.get("due"), t["checked"])
 
     # 2) Fermer les issues dont la ligne a disparu du repo
     vanished = [tid for tid in list(cache["open"].keys()) if tid not in seen_ids]

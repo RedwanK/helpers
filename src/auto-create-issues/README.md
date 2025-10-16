@@ -130,13 +130,46 @@ Chaque tâche est liée à son **fichier source et numéro de ligne** dans le co
 
 ## 📊 Intégration avec GitHub Projects
 
-Tu peux aller plus loin :
+Tu peux toujours garder un fonctionnement simple :
 
-* Crée un **Project** (Kanban ou Table).
+* Crée un **Project** existant (Kanban ou Table).
 * Ajoute une règle automatique :
 
   > “Add to project when label = from-markdown”
 * Tu auras ainsi une vue centralisée de toutes tes tâches issues de Markdown.
+
+### 🚀 Roadmap automatique (optionnel)
+
+Le script sait désormais piloter GitHub Projects (nouvelle génération) via GraphQL :
+
+* il crée un projet `Roadmap` s’il n’existe pas encore ;
+* il ajoute l’Issue en tant qu’item du projet ;
+* il renseigne `Start date` avec la date d’exécution et `Target date` à partir du `due:` présent dans le Markdown (la valeur est nettoyée si le `due` disparaît ou si la tâche est cochée).
+
+Avant de modifier le workflow, prépare un token qui dispose des droits nécessaires :
+
+1. Génère un PAT GitHub (fine-grained recommandé) avec les scopes `repo` et `project`.
+2. Ajoute-le dans `Settings → Secrets and variables → Actions` du dépôt (ou de l’organisation) sous le nom `PROJECT_AUTOMATION_TOKEN`.
+
+Pour activer cette fonctionnalité, ajoute les variables d’environnement suivantes dans ton workflow :
+
+```yaml
+      - name: Run sync script
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.PROJECT_AUTOMATION_TOKEN }}  # PAT avec scopes repo + project
+          GITHUB_PROJECT_SYNC: "true"
+          GITHUB_PROJECT_TITLE: "Roadmap"           # Optionnel – nom du projet
+          GITHUB_PROJECT_START_FIELD: "Start date"  # Optionnel – champ date de début
+          GITHUB_PROJECT_END_FIELD: "Target date"   # Optionnel – champ date de fin
+        run: |
+          python .github/scripts/markdown_todos_to_issues.py
+```
+
+> ℹ️ Le token GitHub Actions par défaut ne peut pas créer un Project V2. Crée un PAT (ou utilise un GitHub App) avec les scopes `repo` et `project`, stocke-le dans `PROJECT_AUTOMATION_TOKEN`, et passe-le au script via `GITHUB_TOKEN` comme ci-dessus.
+
+Tu peux désactiver la synchronisation projets à tout moment en omettant `GITHUB_PROJECT_SYNC` ou en le mettant à `false`.
 
 ---
 
@@ -161,6 +194,7 @@ Tu peux aller plus loin :
 * **GitHub Actions** – exécution automatique à chaque push
 * **Python 3** – lecture et parsing des fichiers Markdown
 * **GitHub REST API v3** – création et mise à jour des Issues
+* **GitHub GraphQL API v4** – gestion automatique du Project Roadmap
 * **Labels dynamiques** – auto-création des labels détectés dans le texte
 
 ---
