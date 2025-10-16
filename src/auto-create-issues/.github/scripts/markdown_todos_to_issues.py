@@ -74,11 +74,20 @@ def _create_date_field(project_id, name):
             name: $name,
             dataType: DATE
           }) {
-            projectV2Field { id name }
+            projectV2Field {
+              ... on ProjectV2Field {
+                id
+                name
+                dataType
+              }
+            }
           }
         }
     """, {"projectId": project_id, "name": name})
-    return data["createProjectV2Field"]["projectV2Field"]["id"]
+    field = data["createProjectV2Field"]["projectV2Field"]
+    if not field or field.get("dataType") != "DATE":
+        raise RuntimeError("Impossible de créer un champ date ProjectV2.")
+    return field["id"]
 
 def ensure_project_context():
     global _PROJECT_CACHE
